@@ -2,114 +2,15 @@ use clap::Parser;
 use regex::bytes::Regex;
 use std::{
 	collections::HashMap,
-	fs::{File, read_dir},
+	fs::File,
 	io::{self, IsTerminal, Read, Write},
-	path::{Path, PathBuf},
+	path::PathBuf,
 };
+use walkdir::WalkDir;
 
 mod util;
 #[allow(clippy::wildcard_imports, reason = "")]
 use util::*;
-
-fn f_counter(
-	re: &Regex,
-	counts: &mut HashMap<Box<[u8]>, usize>,
-	mut f: File,
-	buf: &mut Vec<u8>,
-	err: &mut io::StderrLock,
-) -> io::Result<()> {
-	let cap = buf.capacity();
-	// ensure mem is not dirty before mutation,
-	// and ensure `reserve` is absolute rather than relative.
-	buf.clear();
-	match buf.try_reserve_exact(
-		f.metadata()
-			.map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX))
-			.unwrap_or(0),
-	) {
-		Ok(v) => v,
-		Err(e) => {
-			writeln!(err, "{e}")?;
-			err.flush()?;
-			debug_assert_eq!(cap, buf.capacity());
-			// just-in-case the mem-pressure is extreme
-			buf.shrink_to(cap.div_ceil(2));
-			return Ok(());
-		}
-	}
-
-	// NOTE: consider mem-maps as an alt to buffering.
-	match f.read_to_end(buf) {
-		Ok(_) => {
-			counter(re.find_iter(buf).map(|m| m.as_bytes().into()), counts);
-		}
-		Err(e) => {
-			writeln!(err, "{e}")?;
-			err.flush()?;
-		}
-	}
-	Ok(())
-}
-
-fn walker(
-	re: &Regex,
-	counts: &mut HashMap<Box<[u8]>, usize>,
-	p: &Path,
-	buf: &mut Vec<u8>,
-	err: &mut io::StderrLock,
-) -> io::Result<()> {
-	// TO-DO: lock before checking if it's a dir
-	if !p.is_dir() {
-		return f_counter(
-			re,
-			counts,
-			match File::open(p) {
-				Ok(f) => f,
-				Err(e) => {
-					writeln!(err, "{e}")?;
-					err.flush()?;
-					return Ok(());
-				}
-			},
-			buf,
-			err,
-		);
-	}
-	let dir = match read_dir(p) {
-		Ok(d) => d,
-		Err(e) => {
-			writeln!(err, "{e}")?;
-			err.flush()?;
-			return Ok(());
-		}
-	};
-	for entry in dir {
-		let entry = match entry {
-			Ok(de) => de,
-			Err(e) => {
-				writeln!(err, "{e}")?;
-				err.flush()?;
-				continue;
-			}
-		};
-		let path = entry.path();
-		// TO-DO: lock before checking if it's a dir
-		if path.is_dir() {
-			walker(re, counts, &path, buf, err)?;
-		} else {
-			// assume as regular file.
-			// this may be wrong.
-			match File::open(entry.path()) {
-				Ok(f) => f_counter(re, counts, f, buf, err)?,
-				Err(e) => {
-					writeln!(err, "{e}")?;
-					err.flush()?;
-				}
-			}
-		}
-	}
-	Ok(())
-}
 
 /*
 /// Matching type
@@ -169,8 +70,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let mut buf: Vec<u8> = vec![];
 
 	for path in paths {
-		let mut counts = HashMap::new();
-		walker(&re, &mut counts, path.as_ref(), &mut buf, &mut err)?;
+		let mut counts: HashMap<Box<[u8]>, usize> = HashMap::new();
+		for rde in WalkDir::new(&path)
+			.max_open(8) // power of 2 that's closest to `10` (last known default)
+			.follow_links(true)
+		// not using `filter_map`, to avoid `stderr` lifetime issues
+		{
+			let de = match rde {
+				Ok(de) => de,
+				Err(e) => {
+					write!(&mut err, "{e}")?;
+					err.flush()?;
+					continue;
+				}
+			};
+			let mut f = if de.file_type().is_file() {
+				match File::open(de.path()) {
+					Ok(f) => f,
+					Err(e) => {
+						write!(&mut err, "{e}")?;
+						err.flush()?;
+						continue;
+					}
+				}
+			} else {
+				continue;
+			};
+
+			let cap = buf.capacity();
+			// ensure mem is not dirty before mutation,
+			// and ensure `reserve` is absolute rather than relative.
+			buf.clear();
+			match buf.try_reserve_exact(
+				f.metadata()
+					.map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX))
+					.unwrap_or(0),
+			) {
+				Ok(v) => v,
+				Err(e) => {
+					writeln!(err, "{e}")?;
+					err.flush()?;
+					debug_assert_eq!(cap, buf.capacity());
+					// just-in-case the mem-pressure is extreme
+					buf.shrink_to(cap.div_ceil(2));
+					return Ok(());
+				}
+			}
+
+			// NOTE: consider mem-maps as an alt to buffering.
+			match f.read_to_end(&mut buf) {
+				Ok(_) => {
+					counter(re.find_iter(&buf).map(|m| m.as_bytes().into()), &mut counts);
+				}
+				Err(e) => {
+					writeln!(err, "{e}")?;
+					err.flush()?;
+				}
+			}
+		}
 		let mut counts: Box<[(_, _)]> = counts
 			.into_iter()
 			.map(|(k, c)| (String::from_utf8_lossy(&k).into_owned(), c))

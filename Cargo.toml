@@ -1,11 +1,12 @@
 [package]
 name = "fr3"
-version = "0.2.0"
+version = "0.2.1"
 description = "Performs frequency-analysis of \"words\", on directories (recursive) and files"
 edition = "2024"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+walkdir = "2"
 regex = "1.12"
 
 # can't `forbid`, because of `clap`
